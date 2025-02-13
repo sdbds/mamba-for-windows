@@ -19,6 +19,10 @@
     namespace cub = hipcub;
 #endif
 
+#ifndef M_LOG2E
+#define M_LOG2E 1.4426950408889634074
+#endif
+
 #include "selective_scan.h"
 #include "selective_scan_common.h"
 #include "reverse_scan.cuh"
@@ -496,40 +500,225 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
 
 template<int kNThreads, int kNItems, typename input_t, typename weight_t>
 void selective_scan_bwd_launch(SSMParamsBwd &params, cudaStream_t stream) {
-    BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] {
-        BOOL_SWITCH(params.is_variable_B, kIsVariableB, [&] {
-            BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
-                BOOL_SWITCH(params.delta_softplus, kDeltaSoftplus, [&] {
-                    BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
-                        using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, kIsVariableB, kIsVariableC, kDeltaSoftplus, kHasZ, input_t, weight_t>;
+    auto launch_kernel = [&](auto kIsEvenLen, auto kIsVariableB, 
+                           auto kIsVariableC, auto kDeltaSoftplus, auto kHasZ) {
+        using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, kIsVariableB, kIsVariableC, kDeltaSoftplus, kHasZ, input_t, weight_t>;
                         // using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, true, kIsVariableB, kIsVariableC, kDeltaSoftplus, kHasZ, input_t, weight_t>;
-                        // TODO: check this
-                        constexpr int kSmemSize = Ktraits::kSmemSize + MAX_DSTATE * sizeof(typename Ktraits::scan_t) + (kNThreads + 4 * MAX_DSTATE) * sizeof(typename Ktraits::weight_t);
+                        // TODO: check this        
+        constexpr int kSmemSize = Ktraits::kSmemSize + MAX_DSTATE * sizeof(typename Ktraits::scan_t) + (kNThreads + 4 * MAX_DSTATE) * sizeof(typename Ktraits::weight_t);
 
-                        dim3 grid(params.batch, params.dim);
-                        
-                        auto kernel = &selective_scan_bwd_kernel<Ktraits>;
+        dim3 grid(params.batch, params.dim);
+        
+        auto kernel = &selective_scan_bwd_kernel<Ktraits>;
+        
+        if (kSmemSize >= 48 * 1024) {
+            #ifndef USE_ROCM
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+            #else
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+            std::cerr << "Warning (selective_scan_bwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+            #endif
+        }
+        
+        kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
 
-                        if (kSmemSize >= 48 * 1024) {
-
-                            #ifndef USE_ROCM
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            #else
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            std::cerr << "Warning (selective_scan_bwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
-                            #endif
-
-                        }
-
-                        kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
-                    });
-                });
-            });
-        });
-    });
+    const bool is_even_len = params.seqlen % (kNThreads * kNItems) == 0;
+    const bool has_z = params.z_ptr != nullptr;
+    
+    // 使用嵌套if来处理所有可能的组合
+    if (is_even_len) {
+        if (params.is_variable_B) {
+            if (params.is_variable_C) {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            } else {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            }
+        } else {
+            if (params.is_variable_C) {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            } else {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            }
+        }
+    } else {
+        if (params.is_variable_B) {
+            if (params.is_variable_C) {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            } else {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            }
+        } else {
+            if (params.is_variable_C) {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            } else {
+                if (params.delta_softplus) {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<true>{},
+                                    std::bool_constant<false>{});
+                    }
+                } else {
+                    if (has_z) {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<true>{});
+                    } else {
+                        launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{}, std::bool_constant<false>{},
+                                    std::bool_constant<false>{});
+                    }
+                }
+            }
+        }
+    }
 }
 
 template<typename input_t, typename weight_t>

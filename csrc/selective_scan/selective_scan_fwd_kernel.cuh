@@ -17,6 +17,10 @@
     namespace cub = hipcub;
 #endif
 
+#ifndef M_LOG2E
+#define M_LOG2E 1.4426950408889634074
+#endif
+
 #include "selective_scan.h"
 #include "selective_scan_common.h"
 #include "static_switch.h"
@@ -312,39 +316,118 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
     // Only kNRows == 1 is tested for now, which ofc doesn't differ from previously when we had each block
     // processing 1 row.
     constexpr int kNRows = 1;
-    BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] {
-        BOOL_SWITCH(params.is_variable_B, kIsVariableB, [&] {
-            BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
-                BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
-                    using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
-                    
-                    constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
-                    dim3 grid(params.batch, params.dim / kNRows);
 
+    auto launch_kernel = [&](auto kIsEvenLen, auto kIsVariableB, 
+                           auto kIsVariableC, auto kHasZ) {
+        using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, 1, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
+
+        constexpr int kSmemSize = Ktraits::kSmemSize + 1 * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
+        dim3 grid(params.batch, params.dim / 1);
+        
                     // Had to change this substantially since potentially the hip 
                     // interface for setting kernel launch attributes is slightly different from 
                     // cuda's. In particualar, it seems to expect a plain const void * pointer.
 
-                    auto kernel = &selective_scan_fwd_kernel<Ktraits>;
+        auto kernel = &selective_scan_fwd_kernel<Ktraits>;
 
-                    
-                    if (kSmemSize >= 48 * 1024) {
-                        #ifndef USE_ROCM
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                        #else
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            std::cerr << "Warning (selective_scan_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
-                        #endif
-                    }
 
-                    kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
-                });
-            });
-        });
-    });
+        if (kSmemSize >= 48 * 1024) {
+            #ifndef USE_ROCM
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+            #else
+            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+            std::cerr << "Warning (selective_scan_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+            #endif
+        }
+        
+        kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+
+    const bool is_even_len = params.seqlen % (kNThreads * kNItems) == 0;
+    const bool has_z = params.z_ptr != nullptr;
+
+    // 使用嵌套if来替代嵌套的BOOL_SWITCH
+    if (is_even_len) {
+        if (params.is_variable_B) {
+            if (params.is_variable_C) {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                std::bool_constant<true>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                std::bool_constant<true>{}, std::bool_constant<false>{});
+                }
+            } else {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                std::bool_constant<false>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<true>{},
+                                std::bool_constant<false>{}, std::bool_constant<false>{});
+                }
+            }
+        } else {
+            if (params.is_variable_C) {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                std::bool_constant<true>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                std::bool_constant<true>{}, std::bool_constant<false>{});
+                }
+            } else {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                std::bool_constant<false>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<true>{}, std::bool_constant<false>{},
+                                std::bool_constant<false>{}, std::bool_constant<false>{});
+                }
+            }
+        }
+    } else {
+        // 当is_even_len为false时的情况，复制上面的模式但第一个参数改为false
+        if (params.is_variable_B) {
+            if (params.is_variable_C) {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                std::bool_constant<true>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                std::bool_constant<true>{}, std::bool_constant<false>{});
+                }
+            } else {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                std::bool_constant<false>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<true>{},
+                                std::bool_constant<false>{}, std::bool_constant<false>{});
+                }
+            }
+        } else {
+            if (params.is_variable_C) {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                std::bool_constant<true>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                std::bool_constant<true>{}, std::bool_constant<false>{});
+                }
+            } else {
+                if (has_z) {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                std::bool_constant<false>{}, std::bool_constant<true>{});
+                } else {
+                    launch_kernel(std::bool_constant<false>{}, std::bool_constant<false>{},
+                                std::bool_constant<false>{}, std::bool_constant<false>{});
+                }
+            }
+        }
+    }
 }
 
 template<typename input_t, typename weight_t>
